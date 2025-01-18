@@ -22,7 +22,6 @@ async def repeatKey(val):
 
 
 async def getBattery(mac):
-    
     message = Message(
         destination="org.bluez",
         path="/org/bluez/hci0/dev_" + mac,
@@ -56,7 +55,7 @@ async def sendStatus(online, battery=None):
 async def watchConnection():
     while True:
         try:
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
         except asyncio.CancelledError:
             logger.debug("Connection Watcher shutdown")
 
@@ -68,6 +67,7 @@ async def watchConnection():
             await sendStatus(True, battery)
         except IOError:
             await sendStatus(False)
+            await connectHid()
         except aiomqtt.exceptions.MqttCodeError as err:
             logger.info("mqtt error: " + str(err))
 
@@ -75,39 +75,49 @@ async def watchConnection():
 async def pollHid():
     global reptask
     global stack
+    exceptionCount = 0
     while True:
-        data = hidDevice.read(4)
-        if data:
-            value = str(data[1]) + "-" + str(data[2])
-            if value and value in keys:
-                key = keys[value]
+        try:
+            data = hidDevice.read(4)
+            if data:
+                value = str(data[1]) + "-" + str(data[2])
+                if value and value in keys:
+                    key = keys[value]
 
-                if key != keys["0-0"]:
-                    logger.info("Key pressed: " + str(data) + " - " + value + " - " + key)
-                    stack.append(key)
-                    if reptask:
-                        reptask.cancel()
-                    reptask = asyncio.create_task(repeatKey(key), name="repeater")
-                    logger.debug("Stack:" + str(stack))
-                else:
-                    stackSize = len(stack)
-                    if stackSize == 0:
-                        logger.info("Sending KEY_POWER")
-                        await mqttClient.publish(topic + "/KEY_POWER", payload="KEY_POWER")
+                    if key != keys["0-0"]:
+                        logger.info("Key pressed: " + str(data) + " - " + value + " - " + key)
+                        stack.append(key)
+                        if reptask:
+                            reptask.cancel()
+                        reptask = asyncio.create_task(repeatKey(key), name="repeater")
+                        logger.debug("Stack:" + str(stack))
                     else:
-                        logger.debug("Keyup")
-                        stack.pop(0)
-                        reptask.cancel()
-                        logger.debug("Current stack:" + str(stack))
-            else:
-                logger.error("Unknown key " + value)
-        await asyncio.sleep(0.1)
+                        stackSize = len(stack)
+                        if stackSize == 0:
+                            logger.info("Sending KEY_POWER")
+                            await mqttClient.publish(topic + "/KEY_POWER", payload="KEY_POWER")
+                        else:
+                            logger.debug("Keyup")
+                            stack.pop(0)
+                            reptask.cancel()
+                            logger.debug("Current stack:" + str(stack))
+                else:
+                    logger.error("Unknown key " + value)
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            if exceptionCount < 10:
+                logger.error("Error when reading hid" + str(e))
+                exceptionCount = exceptionCount + 1
+                break
+
 
 async def connectDBus():
     global messageBus
     messageBus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
+
 async def connectHid():
+    logger.info("Trying connect ...")
     global hidDevice
     hidDevice = hid.device()
     hidDevice.open(1356, 3469)
@@ -117,7 +127,7 @@ async def connectHid():
 
 async def setupMQTT(host, port, user, password):
     global mqttClient
-    mqttClient = aiomqtt.Client(bind_port=port, password=password, username=user, hostname=host)
+    mqttClient = aiomqtt.Client(port=port, password=password, username=user, hostname=host)
     await mqttClient.__aenter__()
 
 
@@ -141,9 +151,7 @@ def getConfig():
         return config
 
 
-def setupLogging(
-    logger,
-):
+def setupLogging(logger, config):
     logger.setLevel(config["LOG_LEVEL"])
     lokiEnabled = config["LOG_LOKI"]
     lokiUrl = config["LOKI_URL"]
@@ -181,8 +189,8 @@ hidDevice = None
 reptask = None
 config = getConfig()
 
-logger = logging.getLogger("sonyremote")
-setupLogging(logger)
+logger = logging.getLogger("mqblre")
+setupLogging(logger, config)
 logger.info("Started")
 
 topic = config["MQTT_TOPIC"]
