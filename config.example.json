@@ -3,9 +3,6 @@
     "MQTT_PORT": 1883,
     "MQTT_USERNAME": "",
     "MQTT_PASSWORD": "",
-    "MQTT_TOPIC": "home/room/remotesony",
-    "LOG_LEVEL": "DEBUG",
-    "LOG_CONSOLE": true,
-    "LOG_LOKI": true,
-    "LOKI_URL":"http://lokiserver:3100"
+    "MQTT_TOPIC": "home/remote",
+    "DEVICE_TYPE": "XMRM010"
 }

@@ -1,0 +1,46 @@
+{
+    "vendorId": 10007,
+    "productId": 12985,
+    "releaseKeys": {
+        "1-0-0-0": "KEY_RELEASE",
+        "2-0-0-0": "KEY_RELEASE2"
+    },
+    "noRepeatKeys": [
+        "1-32-0-0",
+        "1-64-0-0"
+    ],
+    "keys": {
+        "1-32-0-0": "KEY_POWER",
+        "1-64-0-0": "KEY_MIC",
+        "2-0-0-30": "KEY_1",
+        "2-0-0-31": "KEY_2",
+        "2-0-0-32": "KEY_3",
+        "2-0-0-33": "KEY_4",
+        "2-0-0-34": "KEY_5",
+        "2-0-0-35": "KEY_6",
+        "2-0-0-36": "KEY_7",
+        "2-0-0-37": "KEY_8",
+        "2-0-0-38": "KEY_9",
+        "2-0-0-39": "KEY_0",
+        "1-0-0-16": "KEY_INPUT",
+        "1-0-0-32": "KEY_TEXT",
+        "1-0-4-0": "KEY_CHLIST",
+        "1-0-2-0": "KEY_SETTINGS",
+        "1-0-0-64": "KEY_NETFLIX",
+        "1-0-0-128": "KEY_AMAZON",
+        "1-8-0-0": "KEY_LEFT",
+        "1-2-0-0": "KEY_UP",
+        "1-4-0-0": "KEY_DOWN",
+        "1-16-0-0": "KEY_RIGHT",
+        "1-0-8-0": "KEY_MI",
+        "1-0-0-8": "KEY_BACK",
+        "1-1-0-0": "KEY_OK",
+        "1-0-32-0": "KEY_CIRCLE",
+        "1-0-0-1": "KEY_GREEN",
+        "1-0-0-4": "KEY_YELLOW",
+        "1-0-128-0": "KEY_BLUE",
+        "1-0-0-2": "KEY_RED",
+        "1-128-0-0": "KEY_VOLUMEUP",
+        "1-0-1-0": "KEY_VOLUMEDOWN"
+    }
+}

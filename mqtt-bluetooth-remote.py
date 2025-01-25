@@ -5,20 +5,30 @@ import json
 from pathlib import Path
 import aiomqtt
 import logging
-from devices.RMFTX621E import keys
-import colorlog
-from colorlog import ColoredFormatter
-from logging_loki import LokiHandler, emitter
 from dbus_next.aio import MessageBus
 from dbus_next import BusType, Message, MessageType, Variant
+from device import DeviceConfig
+import argparse
+from logging.config import dictConfig
 
 
 async def repeatKey(val):
+    first = True
     while True:
         logger.debug("Sending " + str(val))
         global mqttClient
         await mqttClient.publish(topic + "/" + val, payload=val)
-        await asyncio.sleep(0.25)
+        if first:
+            await asyncio.sleep(0.4)
+            first = False
+        else:
+            await asyncio.sleep(0.2)
+
+
+async def singleKey(val):
+    logger.debug("Sending " + str(val))
+    global mqttClient
+    await mqttClient.publish(topic + "/" + val, payload=val)
 
 
 async def getBattery(mac):
@@ -55,11 +65,7 @@ async def sendStatus(online, battery=None):
 async def watchConnection():
     while True:
         try:
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            logger.debug("Connection Watcher shutdown")
-
-        try:
+            await asyncio.sleep(10)
             hidDevice.get_product_string()
             serial = hidDevice.get_serial_number_string()
             serial = serial.replace(":", "_").upper()
@@ -67,48 +73,57 @@ async def watchConnection():
             await sendStatus(True, battery)
         except IOError:
             await sendStatus(False)
-            await connectHid()
         except aiomqtt.exceptions.MqttCodeError as err:
             logger.info("mqtt error: " + str(err))
+        except asyncio.CancelledError:
+            logger.debug("Connection Watcher shutdown")
 
 
-async def pollHid():
+async def pollHid(deviceConfig: DeviceConfig):
     global reptask
     global stack
     exceptionCount = 0
+    keys = deviceConfig.getKeys()
+    releaseKeys = deviceConfig.getReleaseKeys()
+    noRepeatKeys = deviceConfig.getNoRepeatKeys()
     while True:
         try:
-            data = hidDevice.read(4)
+            data = hidDevice.read(8)
             if data:
-                value = str(data[1]) + "-" + str(data[2])
-                if value and value in keys:
-                    key = keys[value]
-
-                    if key != keys["0-0"]:
-                        logger.info("Key pressed: " + str(data) + " - " + value + " - " + key)
-                        stack.append(key)
+                value = f"{data[0]}-{data[1]}-{data[2]}-{data[3]}"
+                if value and (value in keys or value in releaseKeys):
+                    if value not in releaseKeys:
+                        key = keys[value]
+                        logger.info(f"Key pressed: {value}  - {key}")
                         if reptask:
                             reptask.cancel()
-                        reptask = asyncio.create_task(repeatKey(key), name="repeater")
-                        logger.debug("Stack:" + str(stack))
+                        stack.append(key)
+
+                        if value in noRepeatKeys:
+                            await singleKey(key)
+                        else:
+                            reptask = asyncio.create_task(repeatKey(key), name="repeater")
+                            logger.debug("stack:" + str(stack))
                     else:
+                        key = releaseKeys[value]
+                        logger.debug("stack:" + str(stack))
                         stackSize = len(stack)
                         if stackSize == 0:
-                            logger.info("Sending KEY_POWER")
-                            await mqttClient.publish(topic + "/KEY_POWER", payload="KEY_POWER")
+                            await singleKey(key)
                         else:
-                            logger.debug("Keyup")
+                            logger.debug("Keyup release")
                             stack.pop(0)
                             reptask.cancel()
                             logger.debug("Current stack:" + str(stack))
                 else:
-                    logger.error("Unknown key " + value)
+                    logger.warning("Unknown key: " + value)
             await asyncio.sleep(0.1)
         except Exception as e:
             if exceptionCount < 10:
                 logger.error("Error when reading hid" + str(e))
                 exceptionCount = exceptionCount + 1
                 break
+    await exit_prog("SIGINT")
 
 
 async def connectDBus():
@@ -116,25 +131,25 @@ async def connectDBus():
     messageBus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
 
-async def connectHid():
-    logger.info("Trying connect ...")
+async def connectHid(deviceConfig: DeviceConfig):
     global hidDevice
     hidDevice = hid.device()
-    hidDevice.open(1356, 3469)
+    hidDevice.open(deviceConfig.getVendorId(), deviceConfig.getProductId())
     hidDevice.set_nonblocking(True)
-    logger.info("Hid Connected")
+    logger.info(f"Hid {deviceConfig.getName()} Connected")
 
 
 async def setupMQTT(host, port, user, password):
     global mqttClient
-    mqttClient = aiomqtt.Client(port=port, password=password, username=user, hostname=host)
+    mqttClient = aiomqtt.Client(
+        port=port, password=password, username=user, hostname=host, identifier="remote" + config["DEVICE_TYPE"]
+    )
     await mqttClient.__aenter__()
 
 
-async def ask_exit(signame):
+async def exit_prog(signame):
     logger.info("got signal %s: exit" % signame)
     await sendStatus(False)
-    # await mqttClient.__aexit__()
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
     for task in tasks:
@@ -145,42 +160,13 @@ async def ask_exit(signame):
 
 
 def getConfig():
-    configFile = Path(__file__).with_name("config.json")
+    parser = argparse.ArgumentParser(description="MQTT Bluetooth Remote")
+    parser.add_argument("--config", default="config.json", help="Configuration file name")
+    args = parser.parse_args()
+    configFile = Path(__file__).with_name(args.config)
     with configFile.open("r") as jsonfile:
         config = json.load(jsonfile)
         return config
-
-
-def setupLogging(logger, config):
-    logger.setLevel(config["LOG_LEVEL"])
-    lokiEnabled = config["LOG_LOKI"]
-    lokiUrl = config["LOKI_URL"]
-    if lokiEnabled:
-        emitter.LokiEmitter.level_tag = "level"
-        loggingHandler = LokiHandler(url=lokiUrl + "/loki/api/v1/push", tags={"monitor": "grafana"}, version="1")
-        # loggingHandler.setLevel(lokiLevel.upper())
-        logger.addHandler(loggingHandler)
-
-    consoleEnabled = config["LOG_CONSOLE"]
-    if consoleEnabled:
-        handler = colorlog.StreamHandler()
-        formatter = ColoredFormatter(
-            "%(asctime)s %(log_color)s%(levelname)-8s%(reset)s %(white)s%(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-            reset=True,
-            log_colors={
-                "DEBUG": "cyan",
-                "INFO": "green",
-                "WARNING": "yellow",
-                "ERROR": "red",
-                "CRITICAL": "red,bg_white",
-            },
-            secondary_log_colors={},
-            style="%",
-        )
-        handler.setFormatter(formatter)
-        # handler.setLevel(consoleLevel.upper())
-        logger.addHandler(handler)
 
 
 mqttClient = None
@@ -189,18 +175,24 @@ hidDevice = None
 reptask = None
 config = getConfig()
 
-logger = logging.getLogger("mqblre")
-setupLogging(logger, config)
+# load logging configuration
+with open("logging_config.json", "r") as f:
+    logging_config = json.load(f)
+    dictConfig(logging_config)
+
+
+logger = logging.getLogger("remote-" + config["DEVICE_TYPE"])
 logger.info("Started")
 
 topic = config["MQTT_TOPIC"]
+deviceConfig = DeviceConfig(deviceName=config["DEVICE_TYPE"])
 stack = []
 loop = asyncio.get_event_loop()
 for signame in ("SIGINT", "SIGTERM"):
-    loop.add_signal_handler(getattr(signal, signame), lambda signame=signame: asyncio.create_task(ask_exit(signame)))
+    loop.add_signal_handler(getattr(signal, signame), lambda signame=signame: asyncio.create_task(exit_prog(signame)))
 
 loop.create_task(connectDBus(), name="connectDBus")
-loop.create_task(connectHid(), name="connectHid")
+loop.create_task(connectHid(deviceConfig), name="connectHid")
 loop.create_task(
     setupMQTT(
         host=config["MQTT_HOST"],
@@ -211,5 +203,5 @@ loop.create_task(
     name="mqtt",
 )
 loop.create_task(watchConnection(), name="watch")
-loop.create_task(pollHid(), name="hidpoll")
+loop.create_task(pollHid(deviceConfig), name="hidpoll")
 loop.run_forever()
