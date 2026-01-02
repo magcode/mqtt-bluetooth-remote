@@ -10,6 +10,7 @@ from dbus_next import BusType, Message, MessageType, Variant
 from device import DeviceConfig
 import argparse
 from logging.config import dictConfig
+import time
 
 
 async def repeatKey(val):
@@ -86,15 +87,37 @@ async def pollHid(deviceConfig: DeviceConfig):
     keys = deviceConfig.getKeys()
     releaseKeys = deviceConfig.getReleaseKeys()
     noRepeatKeys = deviceConfig.getNoRepeatKeys()
+
+
+    last_data = None
+    last_time = 0
+    current_time = 0
+    COOLDOWN_TIME = 0.4
+
+
+
     while True:
         try:
             data = hidDevice.read(8)
             if data:
+
+
                 value = f"{data[0]}-{data[1]}-{data[2]}-{data[3]}"
                 if value and (value in keys or value in releaseKeys):
                     if value not in releaseKeys:
+                        logger.debug("data received: " + str(data) + " last_data: " + str(last_data))
                         key = keys[value]
+                        if data == last_data:
+                            current_time = time.time()
+                            logger.debug("timing current:" + str(current_time) + " last_time:" + str(last_time))
+                            if data[1] != 0 and (current_time - last_time) < COOLDOWN_TIME:
+                                # Ignoriere dieses Event, da es zu schnell nach dem letzten kam
+                                logger.warning("Ignoriere schnellen Wiederholungsevent current time:" + str(current_time) + " last_time:" + str(last_time))
+                                stack.append(key)
+                                continue
+                        
                         logger.info(f"Key pressed: {value}  - {key}")
+                        last_time = current_time
                         if reptask:
                             reptask.cancel()
                         stack.append(key)
@@ -104,9 +127,12 @@ async def pollHid(deviceConfig: DeviceConfig):
                         else:
                             reptask = asyncio.create_task(repeatKey(key), name="repeater")
                             logger.debug("stack:" + str(stack))
+                        last_data = data
                     else:
+                        # happens in two cases: normal key release or power button (for sony)
+                        # if it was a normal key release, there is still an entry in the stack
                         key = releaseKeys[value]
-                        logger.debug("stack:" + str(stack))
+                        logger.info("stack:" + str(stack))
                         stackSize = len(stack)
                         if stackSize == 0:
                             await singleKey(key)
@@ -115,6 +141,7 @@ async def pollHid(deviceConfig: DeviceConfig):
                             stack.pop(0)
                             reptask.cancel()
                             logger.debug("Current stack:" + str(stack))
+                    
                 else:
                     logger.warning("Unknown key: " + value)
             await asyncio.sleep(0.1)
