@@ -1,15 +1,14 @@
+from malog import setupLogging
 import asyncio
 import signal
 import hid
 import json
 from pathlib import Path
 import aiomqtt
-import logging
 from dbus_next.aio import MessageBus
 from dbus_next import BusType, Message, MessageType, Variant
 from device import DeviceConfig
 import argparse
-from logging.config import dictConfig
 import time
 
 
@@ -88,35 +87,31 @@ async def pollHid(deviceConfig: DeviceConfig):
     releaseKeys = deviceConfig.getReleaseKeys()
     noRepeatKeys = deviceConfig.getNoRepeatKeys()
 
-
-    last_data = None
+    last_key = None
     last_time = 0
     current_time = 0
     COOLDOWN_TIME = 0.4
-
-
 
     while True:
         try:
             data = hidDevice.read(8)
             if data:
-
-
                 value = f"{data[0]}-{data[1]}-{data[2]}-{data[3]}"
+
                 if value and (value in keys or value in releaseKeys):
                     if value not in releaseKeys:
-                        logger.debug("data received: " + str(data) + " last_data: " + str(last_data))
                         key = keys[value]
-                        if data == last_data:
-                            current_time = time.time()
-                            logger.debug("timing current:" + str(current_time) + " last_time:" + str(last_time))
-                            if data[1] != 0 and (current_time - last_time) < COOLDOWN_TIME:
-                                # Ignoriere dieses Event, da es zu schnell nach dem letzten kam
-                                logger.warning("Ignoriere schnellen Wiederholungsevent current time:" + str(current_time) + " last_time:" + str(last_time))
+                        current_time = time.time()
+                        time_diff = current_time - last_time
+                        logLine = f"Press:  {key} LastKey: {last_key} LastTime: {last_time:.2f} TimeDiff: {time_diff:.2f}"
+
+                        if key == last_key:
+                            if time_diff < COOLDOWN_TIME:
+                                logger.info(logLine + " Skipped")
                                 stack.append(key)
                                 continue
-                        
-                        logger.info(f"Key pressed: {value}  - {key}")
+
+                        logger.info(logLine)
                         last_time = current_time
                         if reptask:
                             reptask.cancel()
@@ -127,21 +122,21 @@ async def pollHid(deviceConfig: DeviceConfig):
                         else:
                             reptask = asyncio.create_task(repeatKey(key), name="repeater")
                             logger.debug("stack:" + str(stack))
-                        last_data = data
+
+                        last_key = key
                     else:
                         # happens in two cases: normal key release or power button (for sony)
                         # if it was a normal key release, there is still an entry in the stack
                         key = releaseKeys[value]
-                        logger.info("stack:" + str(stack))
+
                         stackSize = len(stack)
                         if stackSize == 0:
+                            logger.info(f"Release Stack: {stack}, sending POWER")
                             await singleKey(key)
                         else:
-                            logger.debug("Keyup release")
+                            logger.info(f"Release Stack: {stack}, clearing stack")
                             stack.pop(0)
                             reptask.cancel()
-                            logger.debug("Current stack:" + str(stack))
-                    
                 else:
                     logger.warning("Unknown key: " + value)
             await asyncio.sleep(0.1)
@@ -166,12 +161,32 @@ async def connectHid(deviceConfig: DeviceConfig):
     logger.info(f"Hid {deviceConfig.getName()} Connected")
 
 
-async def setupMQTT(host, port, user, password):
+async def setupMQTT_old(host, port, user, password):
     global mqttClient
     mqttClient = aiomqtt.Client(
         port=port, password=password, username=user, hostname=host, identifier="remote" + config["DEVICE_TYPE"]
     )
     await mqttClient.__aenter__()
+
+
+async def mqttLoop(host, port, user, password):
+    while True:
+        try:
+            async with aiomqtt.Client(
+                hostname=host, port=port, username=user, password=password, identifier="remote_" + config["DEVICE_TYPE"]
+            ) as client:
+                logger.info("MQTT connected")
+                global mqttClient
+                mqttClient = client
+                while True:
+                    await asyncio.sleep(1)
+
+        except aiomqtt.MqttError as e:
+            logger.error(f"MQTT Error: {e}. Reconnect in 5 sec ...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Unexpected MQTT error: {e}")
+            await asyncio.sleep(5)
 
 
 async def exit_prog(signame):
@@ -202,13 +217,8 @@ hidDevice = None
 reptask = None
 config = getConfig()
 
-# load logging configuration
-with open("logging_config.json", "r") as f:
-    logging_config = json.load(f)
-    dictConfig(logging_config)
 
-
-logger = logging.getLogger("remote-" + config["DEVICE_TYPE"])
+logger = setupLogging(config)
 logger.info("Started")
 
 topic = config["MQTT_TOPIC"]
@@ -221,7 +231,7 @@ for signame in ("SIGINT", "SIGTERM"):
 loop.create_task(connectDBus(), name="connectDBus")
 loop.create_task(connectHid(deviceConfig), name="connectHid")
 loop.create_task(
-    setupMQTT(
+    mqttLoop(
         host=config["MQTT_HOST"],
         port=config["MQTT_PORT"],
         user=config["MQTT_USERNAME"],
