@@ -40,13 +40,14 @@ async def getBattery(mac):
         member="Get",
         body=["org.bluez.Battery1", "Percentage"],
     )
-    result = await messageBus.call(message)
-    if result.message_type is MessageType.ERROR:
-        logger.warning("Could not read battery")
-        return 0
+    if messageBus:
+        result = await messageBus.call(message)
+        if result.message_type is MessageType.ERROR:
+            logger.warning("Could not read battery")
+            return 0
 
-    if type(result.body[0]) is Variant:
-        return result.body[0].value
+        if type(result.body[0]) is Variant:
+            return result.body[0].value
 
     return 0
 
@@ -55,34 +56,34 @@ async def sendStatus(online, battery=None):
     if online:
         logger.debug("Connection Watcher OK")
         await mqttClient.publish(topic + "/status", payload="online")
-        if battery:
+        if battery and mqttClient:
             await mqttClient.publish(topic + "/battery", payload=battery)
     else:
-        logger.error("Connection Watcher Not connected")
-        await mqttClient.publish(topic + "/status", payload="offline")
+        if mqttClient:
+            await mqttClient.publish(topic + "/status", payload="offline")
 
 
 async def watchConnection():
-    while True:
-        try:
+    try:
+        while True:
             await asyncio.sleep(10)
-            hidDevice.get_product_string()
-            serial = hidDevice.get_serial_number_string()
-            serial = serial.replace(":", "_").upper()
-            battery = await getBattery(serial)
-            await sendStatus(True, battery)
-        except IOError:
-            await sendStatus(False)
-        except aiomqtt.exceptions.MqttCodeError as err:
-            logger.info("mqtt error: " + str(err))
-        except asyncio.CancelledError:
-            logger.debug("Connection Watcher shutdown")
+            try:
+                hidDevice.get_product_string()
+                serial = hidDevice.get_serial_number_string().replace(":", "_").upper()
+                battery = await getBattery(serial)
+                await sendStatus(True, battery)
+            except IOError:
+                await sendStatus(False)
+            except aiomqtt.MqttError as err:
+                logger.info(f"mqtt error: {err}")
+    except asyncio.CancelledError:
+        logger.debug("Connection Watcher Task cancelled - stopping.")
 
 
 async def pollHid(deviceConfig: DeviceConfig):
     global reptask
     global stack
-    exceptionCount = 0
+
     keys = deviceConfig.getKeys()
     releaseKeys = deviceConfig.getReleaseKeys()
     noRepeatKeys = deviceConfig.getNoRepeatKeys()
@@ -103,7 +104,9 @@ async def pollHid(deviceConfig: DeviceConfig):
                         key = keys[value]
                         current_time = time.time()
                         time_diff = current_time - last_time
-                        logLine = f"Press:  {key} LastKey: {last_key} LastTime: {last_time:.2f} TimeDiff: {time_diff:.2f}"
+                        logLine = (
+                            f"Press:  {key} LastKey: {last_key} LastTime: {last_time:.2f} TimeDiff: {time_diff:.2f}"
+                        )
 
                         if key == last_key:
                             if time_diff < COOLDOWN_TIME:
@@ -140,33 +143,31 @@ async def pollHid(deviceConfig: DeviceConfig):
                 else:
                     logger.warning("Unknown key: " + value)
             await asyncio.sleep(0.1)
-        except Exception as e:
-            if exceptionCount < 10:
-                logger.error("Error when reading hid" + str(e))
-                exceptionCount = exceptionCount + 1
-                break
-    await exit_prog("SIGINT")
+        except asyncio.CancelledError:
+            logger.debug("HID Polling Task cancelled - stopping.")
+            if hidDevice:
+                hidDevice.close()
 
 
 async def connectDBus():
     global messageBus
     messageBus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    if messageBus:
+        logger.info("DBus connected")
+    else:
+        logger.error("DBus connection failed")
 
 
-async def connectHid(deviceConfig: DeviceConfig):
+async def connectHid(deviceConfig: DeviceConfig, ready_event: asyncio.Event):
     global hidDevice
-    hidDevice = hid.device()
-    hidDevice.open(deviceConfig.getVendorId(), deviceConfig.getProductId())
-    hidDevice.set_nonblocking(True)
-    logger.info(f"Hid {deviceConfig.getName()} Connected")
-
-
-async def setupMQTT_old(host, port, user, password):
-    global mqttClient
-    mqttClient = aiomqtt.Client(
-        port=port, password=password, username=user, hostname=host, identifier="remote" + config["DEVICE_TYPE"]
-    )
-    await mqttClient.__aenter__()
+    try:
+        hidDevice = hid.device()
+        hidDevice.open(deviceConfig.getVendorId(), deviceConfig.getProductId())
+        hidDevice.set_nonblocking(True)
+        logger.info(f"Hid {deviceConfig.getName()} Connected")
+        ready_event.set()
+    except Exception as e:
+        logger.error(f"Failed to connect HID device: {e}")
 
 
 async def mqttLoop(host, port, user, password):
@@ -189,18 +190,6 @@ async def mqttLoop(host, port, user, password):
             await asyncio.sleep(5)
 
 
-async def exit_prog(signame):
-    logger.info("got signal %s: exit" % signame)
-    await sendStatus(False)
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-
-    for task in tasks:
-        task.cancel()
-    await asyncio.sleep(1)
-    loop.stop()
-    logger.info("Exit")
-
-
 def getConfig():
     parser = argparse.ArgumentParser(description="MQTT Bluetooth Remote")
     parser.add_argument("--config", default="config.json", help="Configuration file name")
@@ -211,34 +200,70 @@ def getConfig():
         return config
 
 
-mqttClient = None
-messageBus = None
-hidDevice = None
-reptask = None
-config = getConfig()
+async def shutdown(signame, stop_event):
+    logger.info(f"Signal {signame} received. Shutting down program...")
+    stop_event.set()  # This wakes up the main() function
 
 
-logger = setupLogging(config)
-logger.info("Started")
+async def main():
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    for signame in ("SIGINT", "SIGTERM"):
+        loop.add_signal_handler(
+            getattr(signal, signame), lambda s=signame: asyncio.create_task(shutdown(s, stop_event))
+        )
 
-topic = config["MQTT_TOPIC"]
-deviceConfig = DeviceConfig(deviceName=config["DEVICE_TYPE"])
-stack = []
-loop = asyncio.get_event_loop()
-for signame in ("SIGINT", "SIGTERM"):
-    loop.add_signal_handler(getattr(signal, signame), lambda signame=signame: asyncio.create_task(exit_prog(signame)))
+    hid_ready_signal = asyncio.Event()
+    loop.create_task(connectHid(deviceConfig, hid_ready_signal), name="connectHid")
 
-loop.create_task(connectDBus(), name="connectDBus")
-loop.create_task(connectHid(deviceConfig), name="connectHid")
-loop.create_task(
-    mqttLoop(
-        host=config["MQTT_HOST"],
-        port=config["MQTT_PORT"],
-        user=config["MQTT_USERNAME"],
-        password=config["MQTT_PASSWORD"],
-    ),
-    name="mqtt",
-)
-loop.create_task(watchConnection(), name="watch")
-loop.create_task(pollHid(deviceConfig), name="hidpoll")
-loop.run_forever()
+    try:
+        await asyncio.wait_for(hid_ready_signal.wait(), timeout=5.0)
+        logger.info("HID device connected successfully.")
+    except asyncio.TimeoutError:
+        logger.error("HID device could not be connected. Exiting.")
+        return
+
+    loop.create_task(connectDBus(), name="connectDBus")
+    loop.create_task(
+        mqttLoop(
+            host=config["MQTT_HOST"],
+            port=config["MQTT_PORT"],
+            user=config["MQTT_USERNAME"],
+            password=config["MQTT_PASSWORD"],
+        ),
+        name="mqtt",
+    )
+    loop.create_task(watchConnection(), name="watch")
+    loop.create_task(pollHid(deviceConfig), name="hidpoll")
+
+    await stop_event.wait()
+    logger.info("Cleanup ...")
+    await sendStatus(False)
+
+    # Kill all running tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        logger.info(f"Cancelling task: {task.get_name()}")
+        task.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("All tasks finished. Exit.")
+
+
+if __name__ == "__main__":
+    mqttClient = None
+    messageBus = None
+    hidDevice = None
+    reptask = None
+    config = getConfig()
+    loop = None
+    logger = setupLogging(config)
+    logger.info("Started")
+
+    topic = config["MQTT_TOPIC"]
+    deviceConfig = DeviceConfig(deviceName=config["DEVICE_TYPE"])
+    stack = []
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
